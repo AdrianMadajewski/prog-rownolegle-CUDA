@@ -1,11 +1,24 @@
-﻿#include "cuda_runtime.h"
+﻿#include "cuda.h"
+#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "driver_types.h"
+#include "device_functions.h"
 
 #include <cstdio>
 #include <random>
 #include <ctime>
 #include <iostream>
+#include <cassert>
+
+// https://stackoverflow.com/questions/35535831/is-there-any-difference-between-cudamallochost-and-cudahostalloc-without-spe
+// https://github.com/CoffeeBeforeArch/cuda_programming/blob/master/02_matrix_mul/tiled/mmul.cu
+
+constexpr int N = 1 << 10;					// 1024
+constexpr int SHARED_MEMORY_SIZE = 1 << 10; // 1024
+
+constexpr int BYTES = N * N * sizeof(int);
+constexpr int RAND_LOW = 0;
+constexpr int RAND_HIGH = 1;
 
 #define checkCudaErrors(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
@@ -20,17 +33,16 @@ inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort =
 int getRandomValue(const int low, const int high);
 void randomizeMatrix(int* matrix, const int size);
 void printMatrix(int* matrix, const int size);
+void verify(int* A, int* B, int* C, const int N);
 
 // Kernel
-__global__ void multiplyKernel(const int* A, const int* B, int* C, const int size);
+__global__ void multiplyKernel(const int* __restrict__ A, 
+	const int* __restrict__ B, 
+	int* __restrict__ C, 
+	const int size);
 
-int main()
+int main(int argc, char **argv)
 {
-	constexpr int N = 16;
-	constexpr int BYTES = N * N * sizeof(int);
-	constexpr int RAND_LOW = 0;
-	constexpr int RAND_HIGH = 1;
-
 	srand(time(NULL));
 
 	int* A_host = nullptr;
@@ -38,21 +50,17 @@ int main()
 	int* C_host = nullptr;
 
 	// Allocate memory on host for A, B, C matrices
-	checkCudaErrors(cudaMallocHost(&A_host, BYTES));
-	checkCudaErrors(cudaMallocHost(&B_host, BYTES));
-	checkCudaErrors(cudaMallocHost(&C_host, BYTES));
+	// https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory-and-memory-banks
 
-	cudaDeviceSynchronize();
+	checkCudaErrors(cudaSetDeviceFlags(cudaDeviceMapHost));
+	checkCudaErrors(cudaHostAlloc(&A_host, BYTES, cudaHostAllocMapped));
+	checkCudaErrors(cudaHostAlloc(&B_host, BYTES, cudaHostAllocMapped));
+	checkCudaErrors(cudaHostAlloc(&C_host, BYTES, cudaHostAllocMapped));
+
+	// cudaDeviceSynchronize();
 
 	randomizeMatrix(A_host, N);
 	randomizeMatrix(B_host, N);
-
-	// Zero C-result array XDD
-	// memset(C_host, 0, SIZE);
-
-	//printMatrix(A_host, N);
-	//printMatrix(B_host, N);
-	//printMatrix(C_host, N);
 
 	int* A_device = nullptr;
 	int* B_device = nullptr;
@@ -70,7 +78,7 @@ int main()
 	checkCudaErrors(cudaHostGetDevicePointer(&B_device, B_host, 0));
 	checkCudaErrors(cudaHostGetDevicePointer(&C_device, C_host, 0));
 
-	int BLOCK_SIZE = 16;	
+	int BLOCK_SIZE = 64;	
 	int GRID_SIZE = (int)ceil(N / BLOCK_SIZE);
 
 	dim3 grid(GRID_SIZE, GRID_SIZE);
@@ -79,23 +87,49 @@ int main()
 	multiplyKernel <<<grid, threads >>> (A_device, B_device, C_device, N);
 
 	cudaDeviceSynchronize();
-	printMatrix(C_host, N);
 
+	verify(A_host, B_host, C_host, N);
+	// printMatrix(C_host, N);
+
+	printf("COMPLETED WITH SUCCESS\n");
 	return 0;
 }
 
-__global__ void multiplyKernel(const int* A, const int* B, int* C, const int size)
+__global__ void multiplyKernel(const int* __restrict__ A, 
+	const int* __restrict__ B, 
+	int* __restrict__ C, 
+	const int size)
 {
 	int row = blockIdx.y * blockDim.y + threadIdx.y;
 	int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-	C[row * size + col] = 0;
-	for (int i = 0; i < size; ++i)
+	__shared__ int shared_A[SHARED_MEMORY_SIZE];
+	__shared__ int shared_B[SHARED_MEMORY_SIZE];
+
+	// No alliasing
+	int sum = 0;
+	for (int i = 0; i < size; i+= blockDim.x)
 	{
-		// printf("A: row=%d,col=%d,i=%d, value=%d\n", row, col, i, A[row * size + i]);
-		// printf("B: row=%d,col=%d,i=%d, value=%d\n", row, col, i, B[row * size + i]);
-		C[row * size + col] += A[row * size + i] * B[i * size + col];
+		// Load elements from tile to shared memory
+		int access_tile = threadIdx.y * blockDim.x + threadIdx.x;
+		shared_A[access_tile] = A[row * N + i + threadIdx.x];
+		shared_B[access_tile] = B[i * N + threadIdx.y * N + col];
+
+		// Intellisense treats it as undefined :(
+		__syncthreads();
+
+		// Matrix multiply
+		for (int j = 0; j < blockDim.x; j++)
+		{
+			sum += shared_A[threadIdx.y * blockDim.x + j] * shared_B[j * blockDim.x + threadIdx.x];
+		}
+
+		// Intellisense treats it as undefined :(
+		__syncthreads();
 	}
+
+	// Assign computed result to matrix
+	C[row * size + col] = sum;
 }
 
 void randomizeMatrix(int* matrix, const int size)
@@ -124,7 +158,8 @@ void printMatrix(int* matrix, const int size)
 
 int getRandomValue(const int low, const int high)
 {
-	return low + static_cast<int>(rand()) * (static_cast<int>(high - low) / RAND_MAX);
+	return low + static_cast<int>(rand()) * 
+		(static_cast<int>(high - low) / RAND_MAX);
 }
 
 void verify(int* A, int* B, int* C, const int N)
@@ -141,7 +176,7 @@ void verify(int* A, int* B, int* C, const int N)
 			}
 
 			// Check against the CPU result
-			assert(tmp == c[i * N + j]);
+			assert(tmp == C[i * N + j]);
 		}
 	}
 }
