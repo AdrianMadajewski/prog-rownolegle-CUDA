@@ -1,4 +1,4 @@
-# Collage Parallel Computing Assigment using NVIDIA CUDA Technology
+# Collage Parallel Computing Assigment using NVIDIA CUDA
 
 Graphic card programing with CUDA. Distinct and in-depth comparison of matrix computations with or without shared-memory usage. Applications of Zero-Copy technique. CPU performance results with OpenMP API.
 
